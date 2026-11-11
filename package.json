@@ -1,0 +1,18 @@
+{
+  "name": "@giladbarnea/pi-keep-cache-warm",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Proof of concept: let a Pi agent keep its prompt cache warm past Pi's 30-minute idle limit while it waits for a known wake-up.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
