@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { breakEvenDeadline, nextStep, readWholePrefix } from "../schedule.ts";
 
 const MINUTE = 60_000;
-const base = { delayMs: 270_000, ttlMs: 300_000, deadline: 50 * MINUTE, lastRefreshAt: 0 };
+const base = { delayMs: 270_000, ttlMs: 300_000, deadline: 50 * MINUTE, lastRefreshAt: 0, notBefore: 0 };
 
 test("a Pi cache_warm in the slot makes us wait for the slot after it", () => {
   assert.deepEqual(nextStep({ ...base, now: 280_000, piWarmTimes: [270_000] }), {
@@ -27,6 +27,22 @@ test("Pi warms that predate our last refresh do not delay us", () => {
 test("handover after Pi's 30-minute stop: Pi's last warm at 27 min, our warm at 31.67 min", () => {
   const piWarmTimes = [1, 2, 3, 4, 5, 6].map((k) => k * 270_000);
   assert.deepEqual(nextStep({ ...base, now: 1_620_000 + 280_000, piWarmTimes }), { type: "warm", lastRefreshAt: 1_620_000 });
+});
+
+test("Pi's refresh still in flight (no entry yet) inside its 30-minute horizon: wait for the horizon, never warm", () => {
+  const piHorizon = { ...base, notBefore: 30 * MINUTE };
+  assert.deepEqual(nextStep({ ...piHorizon, now: 280_000, piWarmTimes: [] }), { type: "wait", at: 30 * MINUTE, lastRefreshAt: 0 });
+  const piWarmTimes = [1, 2, 3, 4, 5].map((k) => k * 270_000);
+  assert.deepEqual(nextStep({ ...piHorizon, now: 1_630_000, piWarmTimes }), { type: "wait", at: 30 * MINUTE, lastRefreshAt: 1_350_000 });
+});
+
+test("at Pi's horizon, the first own warm follows Pi's last warm by one slot", () => {
+  const piWarmTimes = [1, 2, 3, 4, 5, 6].map((k) => k * 270_000);
+  assert.deepEqual(nextStep({ ...base, notBefore: 30 * MINUTE, now: 30 * MINUTE, piWarmTimes }), {
+    type: "wait",
+    at: 1_620_000 + 280_000,
+    lastRefreshAt: 1_620_000,
+  });
 });
 
 test("done once the next slot falls after the deadline", () => {

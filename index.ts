@@ -23,6 +23,8 @@ type Armed = SavedRequest & {
   ttlMs: number;
   delayMs: number;
   lastRefreshAt: number;
+  /** End of Pi's own idle warming; Pi's in-flight refreshes are invisible, so we never warm before it. */
+  notBefore: number;
   timer?: NodeJS.Timeout;
   controller: AbortController;
   warms: number;
@@ -34,6 +36,10 @@ export default function keepCacheWarm(pi: ExtensionAPI): void {
   let lastRequest: SavedRequest | undefined;
   let pendingDeadline: number | undefined;
   let armed: Armed | undefined;
+
+  /** Whether Pi's own idle warmer will refresh this context (default setting "idle", and its cost rule says warm). */
+  const piWillWarm = (model: Model<any>, prefixTokens: number) =>
+    (pi.getSettings().cacheWarming ?? "idle") === "idle" && evaluateCacheWarming(model, prefixTokens, "idle").action === "warm";
 
   const status = (ctx: ExtensionContext, text: string | undefined) => ctx.ui.setStatus(ENTRY_TYPE, text);
 
@@ -70,6 +76,7 @@ export default function keepCacheWarm(pi: ExtensionAPI): void {
     const step = nextStep({
       now: Date.now(),
       lastRefreshAt: run.lastRefreshAt,
+      notBefore: run.notBefore,
       piWarmTimes: piWarmTimes(ctx, run.lastRefreshAt),
       delayMs: run.delayMs,
       ttlMs: run.ttlMs,
@@ -137,6 +144,7 @@ export default function keepCacheWarm(pi: ExtensionAPI): void {
       ttlMs,
       delayMs: getCacheWarmingDelayMs(ttlMs)!,
       lastRefreshAt: request.sentAt,
+      notBefore: piWillWarm(request.model, request.prefixTokens) ? request.sentAt + CACHE_WARMING_MAX_IDLE_AGE_MS : 0,
       controller: new AbortController(),
       warms: 0,
       cost: 0,
@@ -168,13 +176,10 @@ export default function keepCacheWarm(pi: ExtensionAPI): void {
           throw new Error(`Pi declares no prompt cache lifetime for ${model.provider}/${model.id}.`);
         }
         const { warmCost, missCost } = evaluateCacheWarming(model, lastRequest.prefixTokens, "idle");
-        // Pi's default cacheWarming setting is "idle"; its idle warms are free to us, so our budget starts after them.
-        const piWillWarm =
-          (pi.getSettings().cacheWarming ?? "idle") === "idle" &&
-          evaluateCacheWarming(model, lastRequest.prefixTokens, "idle").action === "warm";
+        const piWarms = piWillWarm(model, lastRequest.prefixTokens);
         const capDeadline = breakEvenDeadline({
           lastRequestAt: lastRequest.sentAt,
-          piIdleHorizonMs: piWillWarm ? CACHE_WARMING_MAX_IDLE_AGE_MS : 0,
+          piIdleHorizonMs: piWarms ? CACHE_WARMING_MAX_IDLE_AGE_MS : 0,
           warmCost,
           missCost,
           delayMs,
@@ -192,7 +197,7 @@ export default function keepCacheWarm(pi: ExtensionAPI): void {
             : `Keeping the cache warm until ${until}.`;
         return {
           content: [{ type: "text" as const, text }],
-          details: { grantedMinutes, capMinutes, piWillWarm, warmCost, missCost },
+          details: { grantedMinutes, capMinutes, piWillWarm: piWarms, warmCost, missCost },
         };
       },
     }),

@@ -9,18 +9,21 @@ export type NextStep =
   | { type: "done"; reason: string };
 
 /**
- * Decide what to do when the warm timer fires: wait for a later slot when Pi refreshed meanwhile,
- * finish when the next refresh slot falls after the deadline, otherwise warm now.
+ * Decide what to do when the warm timer fires: wait until `notBefore` (the end of Pi's own idle warming,
+ * 0 when Pi will not warm) because Pi's in-flight refreshes are invisible until they complete; wait for a
+ * later slot when Pi refreshed meanwhile; finish when the next refresh slot falls after the deadline;
+ * otherwise warm now.
  *
  * @example
- * nextStep({ now: 280_000, lastRefreshAt: 0, piWarmTimes: [270_000], delayMs: 270_000, ttlMs: 300_000, deadline: 3_000_000 })
+ * nextStep({ now: 280_000, lastRefreshAt: 0, notBefore: 0, piWarmTimes: [270_000], delayMs: 270_000, ttlMs: 300_000, deadline: 3_000_000 })
  * // { type: "wait", at: 550_000, lastRefreshAt: 270_000 }
- * nextStep({ now: 280_000, lastRefreshAt: 0, piWarmTimes: [], delayMs: 270_000, ttlMs: 300_000, deadline: 3_000_000 })
+ * nextStep({ now: 280_000, lastRefreshAt: 0, notBefore: 0, piWarmTimes: [], delayMs: 270_000, ttlMs: 300_000, deadline: 3_000_000 })
  * // { type: "warm", lastRefreshAt: 0 }
  */
 export function nextStep(input: {
   now: number;
   lastRefreshAt: number;
+  notBefore: number;
   piWarmTimes: number[];
   delayMs: number;
   ttlMs: number;
@@ -29,6 +32,7 @@ export function nextStep(input: {
   const lastRefreshAt = Math.max(input.lastRefreshAt, ...input.piWarmTimes);
   const slot = refreshSlot(lastRefreshAt, input.delayMs);
   if (slot > input.deadline) return { type: "done", reason: "the cache outlives the deadline" };
+  if (input.now < input.notBefore) return { type: "wait", at: input.notBefore, lastRefreshAt };
   if (input.now < slot) return { type: "wait", at: slot, lastRefreshAt };
   return { type: "warm", lastRefreshAt };
 }
