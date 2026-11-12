@@ -21,6 +21,7 @@ const model = {
 /** Loads the extension against a fake Pi and drives one real request, a tool call, and the settle. */
 function harness(prefixTokens: number, warmRead = prefixTokens) {
   const handlers = new Map<string, Function>();
+  const branch: { type: string; kind: string; timestamp: string }[] = [];
   const entries: { customType: string; data: any }[] = [];
   const warms: unknown[] = [];
   let tool: any;
@@ -35,7 +36,7 @@ function harness(prefixTokens: number, warmRead = prefixTokens) {
     model,
     thinkingLevel: "low",
     ui: { setStatus() {} },
-    sessionManager: { getBranch: () => [], getSessionId: () => "session" },
+    sessionManager: { getBranch: () => branch, getSessionId: () => "session" },
     modelRegistry: {
       streamSimple: (_model: unknown, _context: unknown, options: any) => {
         warms.push(options.onPayload());
@@ -49,9 +50,26 @@ function harness(prefixTokens: number, warmRead = prefixTokens) {
     handlers.get("before_provider_request")!({ payload: { model: model.id, max_tokens: 128_000 } }, ctx);
     handlers.get("message_end")!({ message: { role: "assistant", usage: { cacheRead: 0, cacheWrite: prefixTokens } } }, ctx);
   };
+  /** Pi's own idle warmer: decides at its slot, records `cache_warm` when the refresh completes `latencyMs` later. */
+  const simulatePi = (refreshes: number, latencyMs: number) => {
+    let previousCompletion = Date.now();
+    const next = (remaining: number) => {
+      if (remaining === 0) return;
+      setTimeout(() => {
+        handlers.get("cache_warming_decision")!({ type: "cache_warming_decision", action: "warm" }, ctx);
+        setTimeout(() => {
+          previousCompletion = Date.now();
+          branch.push({ type: "usage", kind: "cache_warm", timestamp: new Date(previousCompletion).toISOString() });
+          next(remaining - 1);
+        }, latencyMs);
+      }, previousCompletion + 270_000 - Date.now());
+    };
+    next(refreshes);
+  };
   return {
     entries,
     warms,
+    simulatePi,
     async arm(minutes: number) {
       realRequest();
       const result = await tool.execute("call", { minutes }, undefined, undefined, ctx);
@@ -107,12 +125,23 @@ test("Pi will not warm: first own warm one slot after the request, replaying the
   assert.deepEqual(run.warms, [{ model: model.id, max_tokens: 1 }]);
 });
 
-test("Pi will warm, its refreshes in flight and not yet recorded: no own warm before Pi's 30-minute horizon", async () => {
+test("Pi warming with 19 s refreshes in flight: no own warm until Pi stops at its horizon, then one slot after its last record", async () => {
   const run = harness(200_000);
   await run.arm(60);
-  await advance(30 * MINUTE - 1_000);
+  run.simulatePi(6, 19_000);
+  await advance(6 * 289_000 + 279_000);
   assert.equal(run.warms.length, 0);
-  await advance(2 * MINUTE);
+  await advance(2_000);
+  assert.equal(run.warms.length, 1);
+});
+
+test("Pi stops early after two refreshes: take over one slot after its last record, before the entry expires", async () => {
+  const run = harness(200_000);
+  await run.arm(60);
+  run.simulatePi(2, 19_000);
+  await advance(2 * 289_000 + 279_000);
+  assert.equal(run.warms.length, 0);
+  await advance(2_000);
   assert.equal(run.warms.length, 1);
 });
 

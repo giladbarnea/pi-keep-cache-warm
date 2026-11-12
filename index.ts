@@ -23,8 +23,6 @@ type Armed = SavedRequest & {
   ttlMs: number;
   delayMs: number;
   lastRefreshAt: number;
-  /** End of Pi's own idle warming; Pi's in-flight refreshes are invisible, so we never warm before it. */
-  notBefore: number;
   timer?: NodeJS.Timeout;
   controller: AbortController;
   warms: number;
@@ -36,6 +34,8 @@ export default function keepCacheWarm(pi: ExtensionAPI): void {
   let lastRequest: SavedRequest | undefined;
   let pendingDeadline: number | undefined;
   let armed: Armed | undefined;
+  /** When Pi decided to warm. Its refresh is in flight until its `cache_warm` record lands on completion. */
+  let piWarmDecisionTimes: number[] = [];
 
   /** Whether Pi's own idle warmer will refresh this context (default setting "idle", and its cost rule says warm). */
   const piWillWarm = (model: Model<any>, prefixTokens: number) =>
@@ -76,8 +76,8 @@ export default function keepCacheWarm(pi: ExtensionAPI): void {
     const step = nextStep({
       now: Date.now(),
       lastRefreshAt: run.lastRefreshAt,
-      notBefore: run.notBefore,
       piWarmTimes: piWarmTimes(ctx, run.lastRefreshAt),
+      piWarmDecisionTimes: piWarmDecisionTimes.filter((time) => time > run.lastRefreshAt),
       delayMs: run.delayMs,
       ttlMs: run.ttlMs,
       deadline: run.deadline,
@@ -128,6 +128,10 @@ export default function keepCacheWarm(pi: ExtensionAPI): void {
     lastRequest = { ...lastPayload, prefixTokens: cacheRead + cacheWrite };
   });
 
+  pi.on("cache_warming_decision", (event) => {
+    if (armed && event.action === "warm") piWarmDecisionTimes.push(Date.now());
+  });
+
   pi.on("agent_start", (_event, ctx) => disarm(ctx, "next real request"));
   pi.on("model_select", (_event, ctx) => disarm(ctx, "model changed"));
   pi.on("session_shutdown", (_event, ctx) => disarm(ctx, "session shutdown"));
@@ -144,11 +148,11 @@ export default function keepCacheWarm(pi: ExtensionAPI): void {
       ttlMs,
       delayMs: getCacheWarmingDelayMs(ttlMs)!,
       lastRefreshAt: request.sentAt,
-      notBefore: piWillWarm(request.model, request.prefixTokens) ? request.sentAt + CACHE_WARMING_MAX_IDLE_AGE_MS : 0,
       controller: new AbortController(),
       warms: 0,
       cost: 0,
     };
+    piWarmDecisionTimes = [];
     pi.appendEntry(ENTRY_TYPE, { kind: "arm", deadline: new Date(deadline).toISOString(), prefixTokens: request.prefixTokens });
     status(ctx, `keeping cache warm until ${new Date(deadline).toLocaleTimeString()}`);
     void tick(ctx, armed);
