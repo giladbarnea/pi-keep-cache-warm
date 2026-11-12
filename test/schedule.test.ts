@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { breakEvenMs, nextStep, readWholePrefix } from "../schedule.ts";
+import { breakEvenDeadline, nextStep, readWholePrefix } from "../schedule.ts";
 
 const MINUTE = 60_000;
 const base = { delayMs: 270_000, ttlMs: 300_000, deadline: 50 * MINUTE, lastRefreshAt: 0 };
@@ -34,10 +34,20 @@ test("done once the next slot falls after the deadline", () => {
   assert.equal(nextStep({ ...base, lastRefreshAt: base.deadline - 290_000, now: base.deadline, piWarmTimes: [] }).type, "warm");
 });
 
-test("break-even is about 55 minutes for Anthropic's 5-minute tier", () => {
-  const ms = breakEvenMs({ warmCost: 0.1, missCost: 1.15, delayMs: 270_000, ttlMs: 300_000 });
-  assert.equal(ms, 3_270_000);
-  assert.equal(Math.round(ms / MINUTE), 55);
+const economics = { warmCost: 0.1, missCost: 1.15, delayMs: 270_000, ttlMs: 300_000 };
+
+test("break-even when Pi will not warm: about 55 minutes after the last request", () => {
+  assert.equal(breakEvenDeadline({ ...economics, lastRequestAt: 0, piIdleHorizonMs: 0 }), 3_270_000);
+});
+
+test("break-even when Pi warms its idle 30 minutes for free: about 81 minutes after the last request", () => {
+  const deadline = breakEvenDeadline({ ...economics, lastRequestAt: 0, piIdleHorizonMs: 30 * MINUTE });
+  assert.equal(deadline, 4_890_000);
+  assert.equal(Math.floor(deadline / MINUTE), 81);
+});
+
+test("break-even counts from the last request, not from arming", () => {
+  assert.equal(breakEvenDeadline({ ...economics, lastRequestAt: 1_000, piIdleHorizonMs: 0 }), 3_271_000);
 });
 
 test("prefix guard", () => {

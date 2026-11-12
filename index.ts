@@ -1,4 +1,5 @@
 import {
+  CACHE_WARMING_MAX_IDLE_AGE_MS,
   evaluateCacheWarming,
   getCacheWarmingDelayMs,
   getCacheWarmingRequestOptions,
@@ -9,7 +10,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { breakEvenMs, nextStep, readWholePrefix } from "./schedule.ts";
+import { breakEvenDeadline, nextStep, readWholePrefix } from "./schedule.ts";
 
 const ENTRY_TYPE = "keep-cache-warm";
 const MINUTE = 60_000;
@@ -150,7 +151,7 @@ export default function keepCacheWarm(pi: ExtensionAPI): void {
       name: "keep_cache_warm",
       label: "Keep Cache Warm",
       description:
-        "Keep this session's prompt cache warm while you wait for something you know will wake you, such as a reminder you set or a report you asked for. Call it in the same turn as setting that reminder, with the minutes until you expect to be woken. Warming starts when your turn ends and stops at the deadline or at your next turn. It is capped at the break-even point, past which a cold restart is cheaper.",
+        "Keep this session's prompt cache warm while you wait for something you know will wake you, such as a reminder you set or a report you asked for. Call it in the same turn as setting that reminder, with how many minutes from now the cache should stay warm. Warming starts when your turn ends and stops at the deadline or at your next turn. It is capped at the break-even point, past which a cold restart is cheaper.",
       parameters: Type.Object({
         minutes: Type.Number({ minimum: 1, description: "Minutes from now until you expect the next turn." }),
       }),
@@ -167,12 +168,32 @@ export default function keepCacheWarm(pi: ExtensionAPI): void {
           throw new Error(`Pi declares no prompt cache lifetime for ${model.provider}/${model.id}.`);
         }
         const { warmCost, missCost } = evaluateCacheWarming(model, lastRequest.prefixTokens, "idle");
-        const capMinutes = Math.floor(breakEvenMs({ warmCost, missCost, delayMs, ttlMs }) / MINUTE);
+        // Pi's default cacheWarming setting is "idle"; its idle warms are free to us, so our budget starts after them.
+        const piWillWarm =
+          (pi.getSettings().cacheWarming ?? "idle") === "idle" &&
+          evaluateCacheWarming(model, lastRequest.prefixTokens, "idle").action === "warm";
+        const capDeadline = breakEvenDeadline({
+          lastRequestAt: lastRequest.sentAt,
+          piIdleHorizonMs: piWillWarm ? CACHE_WARMING_MAX_IDLE_AGE_MS : 0,
+          warmCost,
+          missCost,
+          delayMs,
+          ttlMs,
+        });
+        const now = Date.now();
+        const capMinutes = Math.floor((capDeadline - now) / MINUTE);
+        if (capMinutes < 1) throw new Error("Keeping the cache warm no longer pays: a cold restart is cheaper.");
         const grantedMinutes = Math.min(minutes, capMinutes);
-        pendingDeadline = Date.now() + grantedMinutes * MINUTE;
-        const capped = grantedMinutes < minutes ? ` Capped from ${minutes} at break-even (${capMinutes} min).` : "";
-        const text = `Keeping the cache warm for ${grantedMinutes} min once this turn ends, about $${warmCost.toFixed(6)} per warm every ${Math.round(delayMs / 1000)} s.${capped}`;
-        return { content: [{ type: "text" as const, text }], details: { grantedMinutes, capMinutes, warmCost, missCost } };
+        pendingDeadline = now + grantedMinutes * MINUTE;
+        const until = `${grantedMinutes} min from now (${new Date(pendingDeadline).toLocaleTimeString()})`;
+        const text =
+          grantedMinutes < minutes
+            ? `Keeping the cache warm until ${until}, not ${minutes}: past that, a cold restart is cheaper than keeping it warm.`
+            : `Keeping the cache warm until ${until}.`;
+        return {
+          content: [{ type: "text" as const, text }],
+          details: { grantedMinutes, capMinutes, piWillWarm, warmCost, missCost },
+        };
       },
     }),
   );

@@ -39,14 +39,27 @@ export function refreshSlot(lastRefreshAt: number, delayMs: number): number {
 }
 
 /**
- * Longest wait worth warming through when the next request is certain: refreshes cost `warmCost` each,
- * and keep paying until they add up to the `missCost` a cold resume would add.
+ * Latest time worth keeping the cache warm until when the next request is certain. Pi's own idle warms
+ * (`piIdleHorizonMs`, 0 when Pi will not warm) come first; then our refreshes cost `warmCost` each and pay
+ * until they add up to the `missCost` a cold resume would add; the last refresh's TTL covers the tail.
  *
  * @example
- * breakEvenMs({ warmCost: 0.1, missCost: 1.15, delayMs: 270_000, ttlMs: 300_000 }) // 11 * 270_000 + 300_000 = 3_270_000
+ * breakEvenDeadline({ lastRequestAt: 0, piIdleHorizonMs: 0, warmCost: 0.1, missCost: 1.15, delayMs: 270_000, ttlMs: 300_000 })
+ * // 11 * 270_000 + 300_000 = 3_270_000 (54.5 min)
+ * breakEvenDeadline({ lastRequestAt: 0, piIdleHorizonMs: 1_800_000, warmCost: 0.1, missCost: 1.15, delayMs: 270_000, ttlMs: 300_000 })
+ * // 6 * 270_000 + 11 * 270_000 + 300_000 = 4_890_000 (81.5 min)
  */
-export function breakEvenMs(input: { warmCost: number; missCost: number; delayMs: number; ttlMs: number }): number {
-  return Math.floor(input.missCost / input.warmCost) * input.delayMs + input.ttlMs;
+export function breakEvenDeadline(input: {
+  lastRequestAt: number;
+  piIdleHorizonMs: number;
+  warmCost: number;
+  missCost: number;
+  delayMs: number;
+  ttlMs: number;
+}): number {
+  const piRefreshes = Math.floor(input.piIdleHorizonMs / input.delayMs);
+  const ownRefreshes = Math.floor(input.missCost / input.warmCost);
+  return input.lastRequestAt + (piRefreshes + ownRefreshes) * input.delayMs + input.ttlMs;
 }
 
 /**
