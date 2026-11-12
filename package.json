@@ -1,18 +1,47 @@
 {
   "name": "@giladbarnea/pi-keep-cache-warm",
-  "version": "0.0.0",
-  "private": true,
-  "description": "Proof of concept: let a Pi agent keep its prompt cache warm past Pi's 30-minute idle limit while it waits for a known wake-up.",
+  "version": "0.1.0",
+  "description": "Let a Pi agent keep its prompt cache warm past Pi's 30-minute idle limit while it waits for a known wake-up.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-agent",
+    "pi-coding-agent",
+    "prompt-caching",
+    "cache-warming"
+  ],
+  "author": "Gilad Barnea",
   "license": "MIT",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/giladbarnea/pi-keep-cache-warm.git"
+  },
+  "homepage": "https://github.com/giladbarnea/pi-keep-cache-warm#readme",
+  "bugs": {
+    "url": "https://github.com/giladbarnea/pi-keep-cache-warm/issues"
+  },
+  "files": [
+    "index.ts",
+    "schedule.ts",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "test": "node --test test/*.test.ts"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-ai": ">=1.5.1",
+    "@earendil-works/pi-coding-agent": ">=1.5.1"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.5.2",
+    "@earendil-works/pi-coding-agent": "1.5.2",
+    "typebox": "1.3.27"
   },
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   }
 }
