@@ -14,7 +14,9 @@ Requires Pi 1.5.1 or later, which exports the cache-warming economics this exten
 
 ## The tool
 
-`keep_cache_warm(minutes)`: keep the cache warm until `minutes` from now. The agent calls it in the same turn as setting its reminder. Warming starts when the turn ends and stops at the deadline or at the agent's next turn, whichever comes first. The tool replies in the agent's terms, for example `Keeping the cache warm until 50 min from now (14:32:10).`
+`keep_cache_warm(minutes)`: keep the cache warm until `minutes` from now. The agent calls it in the same turn as setting its reminder, and warming starts when that turn ends. The tool replies in the agent's terms, for example `Keeping the cache warm until 50 min from now (14:32:10).`
+
+The window holds until its deadline. A turn in between, such as a team message or a reminder that wakes the agent, only pauses warming. When that turn ends, warming resumes toward the same deadline from the new last request, and that request's own cache read restarts the break-even budget. A custom message stored without starting a turn has no effect. The window closes at the deadline, on a model change, at session shutdown, when the guard fires, or with `keep_cache_warm(0)`.
 
 While armed, the extension resends the last request's exact provider payload with `max_tokens: 1`, once per refresh slot (Pi's refresh delay plus 10 s, every 280 s on a 5-minute cache). The prefix is byte for byte the same, so each warm reads it from the cache.
 

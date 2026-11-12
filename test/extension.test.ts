@@ -71,11 +71,33 @@ function harness(prefixTokens: number, warmRead = prefixTokens) {
     warms,
     simulatePi,
     async arm(minutes: number) {
+      handlers.get("agent_start")!({}, ctx);
       realRequest();
       const result = await tool.execute("call", { minutes }, undefined, undefined, ctx);
       realRequest();
       handlers.get("agent_settled")!({ aborted: false }, ctx);
       return result;
+    },
+    /** A custom message (team message, reminder) that wakes the agent for one turn without calling the tool. */
+    async wake(turnMs: number) {
+      handlers.get("agent_start")!({}, ctx);
+      await advance(turnMs);
+      realRequest();
+      handlers.get("agent_settled")!({ aborted: false }, ctx);
+    },
+    /** A custom message stored while idle, without starting a turn. */
+    storeCustomMessage() {
+      const message = { role: "custom", customType: "team-message", content: "hello", display: true };
+      handlers.get("message_start")?.({ message }, ctx);
+      handlers.get("message_end")!({ message }, ctx);
+      branch.push({ type: "custom_message", kind: "", timestamp: new Date(Date.now()).toISOString() });
+    },
+    async cancel() {
+      handlers.get("agent_start")!({}, ctx);
+      realRequest();
+      await tool.execute("call", { minutes: 0 }, undefined, undefined, ctx);
+      realRequest();
+      handlers.get("agent_settled")!({ aborted: false }, ctx);
     },
   };
 }
@@ -156,4 +178,54 @@ test("a warm that does not read the whole prefix stops warming and says so", asy
   assert.match(message?.data.content, /did not read the prefix from the cache: read 1651 of 3000 tokens, wrote 1349/);
   await advance(10 * MINUTE);
   assert.equal(run.warms.length, 1);
+});
+
+test("a mid-window wake pauses warming and resumes toward the same deadline, without double-warming", async () => {
+  const run = harness(3_000);
+  await run.arm(20);
+  await advance(281_000);
+  assert.equal(run.warms.length, 1);
+  await advance(119_000);
+  await run.wake(10_000);
+  await advance(279_000);
+  assert.equal(run.warms.length, 1, "the pre-wake schedule (560 s) must not fire");
+  await advance(2_000);
+  assert.equal(run.warms.length, 2, "first warm after the wake: one slot after the wake's request");
+  const arm = run.entries.find((entry) => entry.data.kind === "arm")!;
+  const resume = run.entries.find((entry) => entry.data.kind === "resume")!;
+  assert.equal(resume.data.deadline, arm.data.deadline);
+  await advance(30 * MINUTE);
+  const stop = run.entries.find((entry) => entry.data.kind === "stop")!;
+  assert.equal(stop.data.reason, "the cache outlives the deadline");
+  assert.equal(run.warms.length, 3, "warms at 281 s, 691 s and 971 s; the next slot (1251 s) is past the 20-minute deadline");
+});
+
+test("a custom message stored without starting a turn does not affect warming", async () => {
+  const run = harness(3_000);
+  await run.arm(20);
+  await advance(150_000);
+  run.storeCustomMessage();
+  await advance(131_000);
+  assert.equal(run.warms.length, 1);
+  await advance(280_000);
+  assert.equal(run.warms.length, 2);
+  assert.ok(!run.entries.some((entry) => ["pause", "stop"].includes(entry.data.kind)));
+});
+
+test("keep_cache_warm(0) cancels the window", async () => {
+  const run = harness(3_000);
+  await run.arm(20);
+  await advance(100_000);
+  await run.cancel();
+  await advance(20 * MINUTE);
+  assert.equal(run.warms.length, 0);
+  assert.equal(run.entries.find((entry) => entry.data.kind === "stop")!.data.reason, "cancelled");
+});
+
+test("a wake after the deadline closes the window instead of resuming", async () => {
+  const run = harness(3_000);
+  await run.arm(10);
+  await run.wake(11 * MINUTE);
+  assert.ok(!run.entries.some((entry) => entry.data.kind === "resume"));
+  assert.equal(run.entries.find((entry) => entry.data.kind === "stop")!.data.reason, "deadline reached");
 });
