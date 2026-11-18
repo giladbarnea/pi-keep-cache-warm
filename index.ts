@@ -15,8 +15,8 @@ import { breakEvenDeadline, nextStep, readWholePrefix } from "./schedule.ts";
 const ENTRY_TYPE = "keep-cache-warm";
 const MINUTE = 60_000;
 
-/** The last real session request: its exact provider payload and what it cached. */
-type SavedRequest = { payload: Record<string, unknown>; model: Model<any>; sentAt: number; prefixTokens: number };
+/** The last real session request: its exact provider payload, what it cached, and whether it ended in an error or abort. */
+type SavedRequest = { payload: Record<string, unknown>; model: Model<any>; sentAt: number; prefixTokens: number; failed: boolean };
 
 type Armed = SavedRequest & {
   deadline: number;
@@ -67,7 +67,7 @@ export default function keepCacheWarm(pi: ExtensionAPI): void {
     return run;
   }
 
-  /** Close the window: deadline reached, cancelled, model changed, session ended, or the guard fired. */
+  /** Close the window: deadline reached, cancelled, a wake failed or aborted, model changed, session ended, or the guard fired. */
   function disarm(ctx: ExtensionContext, reason: string): void {
     if (windowDeadline === undefined) return;
     windowDeadline = undefined;
@@ -170,8 +170,8 @@ export default function keepCacheWarm(pi: ExtensionAPI): void {
 
   pi.on("message_end", (event) => {
     if (event.message.role !== "assistant" || !lastPayload) return;
-    const { cacheRead, cacheWrite } = event.message.usage;
-    lastRequest = { ...lastPayload, prefixTokens: cacheRead + cacheWrite };
+    const { usage, stopReason } = event.message;
+    lastRequest = { ...lastPayload, prefixTokens: usage.cacheRead + usage.cacheWrite, failed: stopReason === "error" || stopReason === "aborted" };
   });
 
   pi.on("cache_warming_decision", (event) => {
@@ -184,7 +184,7 @@ export default function keepCacheWarm(pi: ExtensionAPI): void {
   pi.on("model_select", (_event, ctx) => disarm(ctx, "model changed"));
   pi.on("session_shutdown", (_event, ctx) => disarm(ctx, "session shutdown"));
 
-  pi.on("agent_settled", (_event, ctx) => {
+  pi.on("agent_settled", (event, ctx) => {
     const pending = pendingDeadline;
     pendingDeadline = undefined;
     if (pending === null) return disarm(ctx, "cancelled");
@@ -194,6 +194,8 @@ export default function keepCacheWarm(pi: ExtensionAPI): void {
       return start(ctx, "arm");
     }
     if (windowDeadline === undefined) return;
+    if (event.aborted) return disarm(ctx, "turn aborted");
+    if (lastRequest!.failed) return disarm(ctx, "turn failed");
     if (Date.now() >= windowDeadline) return disarm(ctx, "deadline reached");
     if (capDeadline(lastRequest!)! <= Date.now()) return disarm(ctx, "break-even passed");
     start(ctx, "resume");
