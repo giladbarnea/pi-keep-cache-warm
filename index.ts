@@ -67,7 +67,7 @@ export default function keepCacheWarm(pi: ExtensionAPI): void {
     return run;
   }
 
-  /** Close the window: deadline reached, cancelled, a wake failed or aborted, model changed, session ended, or the guard fired. */
+  /** Close the window: deadline reached, cancelled, a turn failed or aborted, model changed, session ended, or the guard fired. */
   function disarm(ctx: ExtensionContext, reason: string): void {
     if (windowDeadline === undefined) return;
     windowDeadline = undefined;
@@ -188,15 +188,15 @@ export default function keepCacheWarm(pi: ExtensionAPI): void {
     const pending = pendingDeadline;
     pendingDeadline = undefined;
     if (pending === null) return disarm(ctx, "cancelled");
+    if (pending === undefined && windowDeadline === undefined) return;
+    if (event.aborted) return disarm(ctx, "turn aborted");
+    if (lastRequest!.failed) return disarm(ctx, "turn failed");
     if (pending !== undefined) {
       pause();
       windowDeadline = pending;
       return start(ctx, "arm");
     }
-    if (windowDeadline === undefined) return;
-    if (event.aborted) return disarm(ctx, "turn aborted");
-    if (lastRequest!.failed) return disarm(ctx, "turn failed");
-    if (Date.now() >= windowDeadline) return disarm(ctx, "deadline reached");
+    if (Date.now() >= windowDeadline!) return disarm(ctx, "deadline reached");
     if (capDeadline(lastRequest!)! <= Date.now()) return disarm(ctx, "break-even passed");
     start(ctx, "resume");
   });

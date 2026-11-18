@@ -170,6 +170,7 @@ async function world(replies: Reply[]) {
   });
   await session.setModel(modelRuntime.getModel("sim", "sim-model")!);
   const branch = () => session.sessionManager.getBranch();
+  const armingTurn = () => session.prompt("Wait for the reminder.");
   return {
     session,
     requests,
@@ -178,9 +179,10 @@ async function world(replies: Reply[]) {
       branch().flatMap((entry) => (entry.type === "custom" && entry.customType === "keep-cache-warm" ? [entry.data as Record<string, unknown>] : [])),
     /** Messages the extension posted into the conversation. */
     messages: () => branch().filter((entry) => entry.type === "custom_message" && entry.customType === "keep-cache-warm"),
-    /** The agent calls keep_cache_warm(20) and its turn ends; the window is armed. */
+    /** The agent's turn that calls keep_cache_warm(20); the window arms when it settles. */
+    armingTurn,
     async arm() {
-      await until(session.prompt("Wait for the reminder."));
+      await until(armingTurn());
     },
     /** A reminder wakes the agent for one turn. */
     wake() {
@@ -258,5 +260,52 @@ test("a wake cancelled mid-request closes the window quietly, without replaying 
   assert.ok(!run.entries().some((entry) => entry.kind === "resume"));
   assert.equal(run.entries().at(-1)?.kind, "stop");
   assert.equal(run.entries().at(-1)?.reason, "turn aborted");
+  assert.deepEqual(run.messages(), [], "no warning in the conversation");
+});
+
+test("an arming turn whose follow-up fails but succeeds on Pi's own retry arms as usual, from the successful request", async (t) => {
+  const run = await world([{ tool: "keep_cache_warm", arguments: { minutes: 20 } }, OVERLOADED, { text: "Waiting." }, { text: "Done." }]);
+  t.after(() => run.session.dispose());
+  await run.arm();
+  assert.deepEqual(run.requests.map((request) => request.outcome), ["tool keep_cache_warm", "error", "text"], "Pi retried the failed follow-up once");
+  const [toolCall, , retried] = run.requests;
+
+  await advance(25 * MINUTE);
+  const arm = run.entries().find((entry) => entry.kind === "arm");
+  assert.equal(arm?.deadline, new Date(toolCall.at + 20 * MINUTE).toISOString(), "the deadline the tool granted");
+  const warms = warmsAfter(run.requests, retried.at);
+  assert.deepEqual(
+    warms.map((warm) => warm.at - retried.at),
+    [280_000, 560_000, 840_000, 1_120_000],
+    "warms one slot after the successful request, until the next slot passes the 20-minute deadline",
+  );
+  for (const warm of warms) assert.deepEqual(warm.payload, { ...retried.payload, max_tokens: 1 });
+  assert.deepEqual(run.messages(), [], "no warning in the conversation");
+});
+
+test("an arming turn that still fails after keep_cache_warm and Pi's retries never starts warming", async (t) => {
+  const run = await world([{ tool: "keep_cache_warm", arguments: { minutes: 20 } }, OVERLOADED, OVERLOADED, OVERLOADED, OVERLOADED]);
+  t.after(() => run.session.dispose());
+  await run.arm();
+  assert.deepEqual(run.requests.map((request) => request.outcome), ["tool keep_cache_warm", "error", "error", "error", "error"]);
+
+  await advance(25 * MINUTE);
+  assert.deepEqual(warmsAfter(run.requests, 0), [], "no warm, so the failed request is never replayed");
+  assert.ok(!run.entries().some((entry) => entry.kind === "arm"), "the window never arms");
+  assert.deepEqual(run.messages(), [], "no warning in the conversation");
+});
+
+test("an arming turn cancelled after keep_cache_warm never starts warming", async (t) => {
+  const run = await world([{ tool: "keep_cache_warm", arguments: { minutes: 20 } }, "hang"]);
+  t.after(() => run.session.dispose());
+  const arming = run.armingTurn();
+  await advance(5_000);
+  await run.session.abort();
+  await until(arming);
+  assert.deepEqual(run.requests.map((request) => request.outcome), ["tool keep_cache_warm", "aborted"]);
+
+  await advance(25 * MINUTE);
+  assert.deepEqual(warmsAfter(run.requests, 0), [], "no warm, so the cancelled request is never replayed");
+  assert.ok(!run.entries().some((entry) => entry.kind === "arm"), "the window never arms");
   assert.deepEqual(run.messages(), [], "no warning in the conversation");
 });
