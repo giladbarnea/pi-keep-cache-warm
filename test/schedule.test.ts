@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { breakEvenDeadline, nextStep, readWholePrefix } from "../schedule.ts";
 
 const MINUTE = 60_000;
-const base = { delayMs: 270_000, ttlMs: 300_000, deadline: 50 * MINUTE, lastRefreshAt: 0, notBefore: 0 };
+const base = { delayMs: 270_000, ttlMs: 300_000, deadline: 50 * MINUTE, lastRefreshAt: 0, piWarmDecisionTimes: [] as number[] };
 
 test("a Pi cache_warm in the slot makes us wait for the slot after it", () => {
   assert.deepEqual(nextStep({ ...base, now: 280_000, piWarmTimes: [270_000] }), {
@@ -29,19 +29,28 @@ test("handover after Pi's 30-minute stop: Pi's last warm at 27 min, our warm at 
   assert.deepEqual(nextStep({ ...base, now: 1_620_000 + 280_000, piWarmTimes }), { type: "warm", lastRefreshAt: 1_620_000 });
 });
 
-test("Pi's refresh still in flight (no entry yet) inside its 30-minute horizon: wait for the horizon, never warm", () => {
-  const piHorizon = { ...base, notBefore: 30 * MINUTE };
-  assert.deepEqual(nextStep({ ...piHorizon, now: 280_000, piWarmTimes: [] }), { type: "wait", at: 30 * MINUTE, lastRefreshAt: 0 });
-  const piWarmTimes = [1, 2, 3, 4, 5].map((k) => k * 270_000);
-  assert.deepEqual(nextStep({ ...piHorizon, now: 1_630_000, piWarmTimes }), { type: "wait", at: 30 * MINUTE, lastRefreshAt: 1_350_000 });
+test("Pi decided to warm and its record has not landed (refresh in flight): wait, never warm", () => {
+  assert.deepEqual(nextStep({ ...base, now: 280_000, piWarmTimes: [], piWarmDecisionTimes: [270_000] }), {
+    type: "wait",
+    at: 270_000 + 280_000,
+    lastRefreshAt: 270_000,
+  });
 });
 
-test("at Pi's horizon, the first own warm follows Pi's last warm by one slot", () => {
-  const piWarmTimes = [1, 2, 3, 4, 5, 6].map((k) => k * 270_000);
-  assert.deepEqual(nextStep({ ...base, notBefore: 30 * MINUTE, now: 30 * MINUTE, piWarmTimes }), {
+test("in flight mid-horizon: five records landed, the sixth refresh is decided but unfinished", () => {
+  const piWarmTimes = [1, 2, 3, 4, 5].map((k) => k * 289_000);
+  const sixthDecision = 5 * 289_000 + 270_000;
+  assert.deepEqual(nextStep({ ...base, now: 5 * 289_000 + 280_000, piWarmTimes, piWarmDecisionTimes: [sixthDecision] }), {
     type: "wait",
-    at: 1_620_000 + 280_000,
-    lastRefreshAt: 1_620_000,
+    at: sixthDecision + 280_000,
+    lastRefreshAt: sixthDecision,
+  });
+});
+
+test("Pi stopped early: no record and no decision since its last refresh, so take over before the entry expires", () => {
+  assert.deepEqual(nextStep({ ...base, now: 560_000 + 280_000, piWarmTimes: [270_000, 560_000] }), {
+    type: "warm",
+    lastRefreshAt: 560_000,
   });
 });
 

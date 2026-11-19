@@ -15,16 +15,14 @@ import { breakEvenDeadline, nextStep, readWholePrefix } from "./schedule.ts";
 const ENTRY_TYPE = "keep-cache-warm";
 const MINUTE = 60_000;
 
-/** The last real session request: its exact provider payload and what it cached. */
-type SavedRequest = { payload: Record<string, unknown>; model: Model<any>; sentAt: number; prefixTokens: number };
+/** The last real session request: its exact provider payload, what it cached, and whether it ended in an error or abort. */
+type SavedRequest = { payload: Record<string, unknown>; model: Model<any>; sentAt: number; prefixTokens: number; failed: boolean };
 
 type Armed = SavedRequest & {
   deadline: number;
   ttlMs: number;
   delayMs: number;
   lastRefreshAt: number;
-  /** End of Pi's own idle warming; Pi's in-flight refreshes are invisible, so we never warm before it. */
-  notBefore: number;
   timer?: NodeJS.Timeout;
   controller: AbortController;
   warms: number;
@@ -34,23 +32,71 @@ type Armed = SavedRequest & {
 export default function keepCacheWarm(pi: ExtensionAPI): void {
   let lastPayload: { payload: Record<string, unknown>; model: Model<any>; sentAt: number } | undefined;
   let lastRequest: SavedRequest | undefined;
-  let pendingDeadline: number | undefined;
+  /** Set by the tool during a turn and applied when the turn settles: a new deadline, or null to cancel. */
+  let pendingDeadline: number | null | undefined;
+  /** The window the agent asked for. It outlives turns: a wake pauses warming, and the settle resumes it, unless the turn failed or was cancelled, which closes the window. */
+  let windowDeadline: number | undefined;
+  /** The active warming run; undefined while paused by a turn or when no window is armed. */
   let armed: Armed | undefined;
+  /** When Pi decided to warm. Its refresh is in flight until its `cache_warm` record lands on completion. */
+  let piWarmDecisionTimes: number[] = [];
 
   /** Whether Pi's own idle warmer will refresh this context (default setting "idle", and its cost rule says warm). */
   const piWillWarm = (model: Model<any>, prefixTokens: number) =>
     (pi.getSettings().cacheWarming ?? "idle") === "idle" && evaluateCacheWarming(model, prefixTokens, "idle").action === "warm";
 
+  /** Latest time worth keeping `request`'s cache warm until, or undefined when Pi cannot warm this model. */
+  function capDeadline(request: SavedRequest): number | undefined {
+    const ttlMs = getPromptCacheTtlMs(request.model);
+    const delayMs = ttlMs === undefined ? undefined : getCacheWarmingDelayMs(ttlMs);
+    if (ttlMs === undefined || delayMs === undefined) return undefined;
+    const { warmCost, missCost } = evaluateCacheWarming(request.model, request.prefixTokens, "idle");
+    const piIdleHorizonMs = piWillWarm(request.model, request.prefixTokens) ? CACHE_WARMING_MAX_IDLE_AGE_MS : 0;
+    return breakEvenDeadline({ lastRequestAt: request.sentAt, piIdleHorizonMs, warmCost, missCost, delayMs, ttlMs });
+  }
+
   const status = (ctx: ExtensionContext, text: string | undefined) => ctx.ui.setStatus(ENTRY_TYPE, text);
 
-  function disarm(ctx: ExtensionContext, reason: string): void {
+  /** Stop the active run without closing the window. */
+  function pause(): Armed | undefined {
     const run = armed;
-    if (!run) return;
+    if (!run) return undefined;
     armed = undefined;
     clearTimeout(run.timer);
     run.controller.abort();
-    pi.appendEntry(ENTRY_TYPE, { kind: "stop", reason, warms: run.warms, cost: run.cost });
-    status(ctx, run.warms > 0 ? `cache kept warm: ${run.warms} warms, $${run.cost.toFixed(6)} (${reason})` : undefined);
+    return run;
+  }
+
+  /** Close the window: deadline reached, cancelled, a turn failed or aborted, model changed, session ended, or the guard fired. */
+  function disarm(ctx: ExtensionContext, reason: string): void {
+    if (windowDeadline === undefined) return;
+    windowDeadline = undefined;
+    const run = pause();
+    const warms = run?.warms ?? 0;
+    const cost = run?.cost ?? 0;
+    pi.appendEntry(ENTRY_TYPE, { kind: "stop", reason, warms, cost });
+    status(ctx, warms > 0 ? `cache kept warm: ${warms} warms, $${cost.toFixed(6)} (${reason})` : undefined);
+  }
+
+  /** Start warming toward the window's deadline from the last request, capped at its break-even. */
+  function start(ctx: ExtensionContext, kind: "arm" | "resume"): void {
+    const request = lastRequest!;
+    const deadline = Math.min(windowDeadline!, capDeadline(request)!);
+    const ttlMs = getPromptCacheTtlMs(request.model)!;
+    armed = {
+      ...request,
+      deadline,
+      ttlMs,
+      delayMs: getCacheWarmingDelayMs(ttlMs)!,
+      lastRefreshAt: request.sentAt,
+      controller: new AbortController(),
+      warms: 0,
+      cost: 0,
+    };
+    piWarmDecisionTimes = [];
+    pi.appendEntry(ENTRY_TYPE, { kind, deadline: new Date(deadline).toISOString(), prefixTokens: request.prefixTokens });
+    status(ctx, `keeping cache warm until ${new Date(deadline).toLocaleTimeString()}`);
+    void tick(ctx, armed);
   }
 
   function fail(ctx: ExtensionContext, text: string): void {
@@ -76,8 +122,8 @@ export default function keepCacheWarm(pi: ExtensionAPI): void {
     const step = nextStep({
       now: Date.now(),
       lastRefreshAt: run.lastRefreshAt,
-      notBefore: run.notBefore,
       piWarmTimes: piWarmTimes(ctx, run.lastRefreshAt),
+      piWarmDecisionTimes: piWarmDecisionTimes.filter((time) => time > run.lastRefreshAt),
       delayMs: run.delayMs,
       ttlMs: run.ttlMs,
       deadline: run.deadline,
@@ -124,34 +170,35 @@ export default function keepCacheWarm(pi: ExtensionAPI): void {
 
   pi.on("message_end", (event) => {
     if (event.message.role !== "assistant" || !lastPayload) return;
-    const { cacheRead, cacheWrite } = event.message.usage;
-    lastRequest = { ...lastPayload, prefixTokens: cacheRead + cacheWrite };
+    const { usage, stopReason } = event.message;
+    lastRequest = { ...lastPayload, prefixTokens: usage.cacheRead + usage.cacheWrite, failed: stopReason === "error" || stopReason === "aborted" };
   });
 
-  pi.on("agent_start", (_event, ctx) => disarm(ctx, "next real request"));
+  pi.on("cache_warming_decision", (event) => {
+    if (armed && event.action === "warm") piWarmDecisionTimes.push(Date.now());
+  });
+
+  pi.on("agent_start", () => {
+    if (pause()) pi.appendEntry(ENTRY_TYPE, { kind: "pause", reason: "turn started" });
+  });
   pi.on("model_select", (_event, ctx) => disarm(ctx, "model changed"));
   pi.on("session_shutdown", (_event, ctx) => disarm(ctx, "session shutdown"));
 
   pi.on("agent_settled", (event, ctx) => {
-    const deadline = pendingDeadline;
+    const pending = pendingDeadline;
     pendingDeadline = undefined;
-    if (deadline === undefined || event.aborted || !lastRequest) return;
-    const request = lastRequest;
-    const ttlMs = getPromptCacheTtlMs(request.model)!;
-    armed = {
-      ...request,
-      deadline,
-      ttlMs,
-      delayMs: getCacheWarmingDelayMs(ttlMs)!,
-      lastRefreshAt: request.sentAt,
-      notBefore: piWillWarm(request.model, request.prefixTokens) ? request.sentAt + CACHE_WARMING_MAX_IDLE_AGE_MS : 0,
-      controller: new AbortController(),
-      warms: 0,
-      cost: 0,
-    };
-    pi.appendEntry(ENTRY_TYPE, { kind: "arm", deadline: new Date(deadline).toISOString(), prefixTokens: request.prefixTokens });
-    status(ctx, `keeping cache warm until ${new Date(deadline).toLocaleTimeString()}`);
-    void tick(ctx, armed);
+    if (pending === null) return disarm(ctx, "cancelled");
+    if (pending === undefined && windowDeadline === undefined) return;
+    if (event.aborted) return disarm(ctx, "turn aborted");
+    if (lastRequest!.failed) return disarm(ctx, "turn failed");
+    if (pending !== undefined) {
+      pause();
+      windowDeadline = pending;
+      return start(ctx, "arm");
+    }
+    if (Date.now() >= windowDeadline!) return disarm(ctx, "deadline reached");
+    if (capDeadline(lastRequest!)! <= Date.now()) return disarm(ctx, "break-even passed");
+    start(ctx, "resume");
   });
 
   pi.registerTool(
@@ -159,45 +206,37 @@ export default function keepCacheWarm(pi: ExtensionAPI): void {
       name: "keep_cache_warm",
       label: "Keep Cache Warm",
       description:
-        "Keep this session's prompt cache warm while you wait for something you know will wake you, such as a reminder you set or a report you asked for. Call it in the same turn as setting that reminder, with how many minutes from now the cache should stay warm. Warming starts when your turn ends and stops at the deadline or at your next turn. It is capped at the break-even point, past which a cold restart is cheaper.",
+        "Keep this session's prompt cache warm while you wait for something you know will wake you, such as a reminder you set or a report you asked for. Call it in the same turn as setting that reminder, with how many minutes from now the cache should stay warm. Warming starts when your turn ends, unless it fails or is cancelled. A turn in between (a reminder or a message waking you) pauses it, and it resumes toward the same deadline when that turn ends, unless it fails or is cancelled, which closes the window. It is capped at the break-even point, past which a cold restart is cheaper. Call it with 0 to cancel.",
       parameters: Type.Object({
-        minutes: Type.Number({ minimum: 1, description: "Minutes from now until you expect the next turn." }),
+        minutes: Type.Number({ minimum: 0, description: "Minutes from now the cache should stay warm; 0 cancels." }),
       }),
       async execute(_toolCallId, { minutes }, _signal, _onUpdate, ctx) {
+        if (minutes === 0) {
+          pendingDeadline = null;
+          return { content: [{ type: "text" as const, text: "Cache warming cancelled." }], details: { grantedMinutes: 0 } };
+        }
         const model = ctx.model;
         if (!model || !lastRequest) throw new Error("No previous request to keep warm.");
         if (lastRequest.prefixTokens === 0) throw new Error("The last request cached nothing, so there is nothing to keep warm.");
         if (!isCacheWarmingReplayable(model, { reasoning: ctx.thinkingLevel === "off" ? undefined : ctx.thinkingLevel })) {
           throw new Error(`${model.provider}/${model.id} cannot be replayed with a one-token cap at this thinking level.`);
         }
-        const ttlMs = getPromptCacheTtlMs(model);
-        const delayMs = ttlMs === undefined ? undefined : getCacheWarmingDelayMs(ttlMs);
-        if (ttlMs === undefined || delayMs === undefined) {
-          throw new Error(`Pi declares no prompt cache lifetime for ${model.provider}/${model.id}.`);
-        }
-        const { warmCost, missCost } = evaluateCacheWarming(model, lastRequest.prefixTokens, "idle");
+        const cap = capDeadline(lastRequest);
+        if (cap === undefined) throw new Error(`Pi declares no prompt cache lifetime for ${model.provider}/${model.id}.`);
         const piWarms = piWillWarm(model, lastRequest.prefixTokens);
-        const capDeadline = breakEvenDeadline({
-          lastRequestAt: lastRequest.sentAt,
-          piIdleHorizonMs: piWarms ? CACHE_WARMING_MAX_IDLE_AGE_MS : 0,
-          warmCost,
-          missCost,
-          delayMs,
-          ttlMs,
-        });
         const now = Date.now();
-        const capMinutes = Math.floor((capDeadline - now) / MINUTE);
+        const capMinutes = Math.floor((cap - now) / MINUTE);
         if (capMinutes < 1) throw new Error("Keeping the cache warm no longer pays: a cold restart is cheaper.");
         const grantedMinutes = Math.min(minutes, capMinutes);
         pendingDeadline = now + grantedMinutes * MINUTE;
         const until = `${grantedMinutes} min from now (${new Date(pendingDeadline).toLocaleTimeString()})`;
         const text =
           grantedMinutes < minutes
-            ? `Keeping the cache warm until ${until}, not ${minutes}: past that, a cold restart is cheaper than keeping it warm.`
-            : `Keeping the cache warm until ${until}.`;
+            ? `Keeping the cache warm until ${until}, not ${minutes}: past that, a cold restart is cheaper than keeping it warm. Warming starts when this turn ends, unless it fails or is cancelled.`
+            : `Keeping the cache warm until ${until}. Warming starts when this turn ends, unless it fails or is cancelled.`;
         return {
           content: [{ type: "text" as const, text }],
-          details: { grantedMinutes, capMinutes, piWillWarm: piWarms, warmCost, missCost },
+          details: { grantedMinutes, capMinutes, piWillWarm: piWarms },
         };
       },
     }),
