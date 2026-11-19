@@ -34,7 +34,7 @@ export default function keepCacheWarm(pi: ExtensionAPI): void {
   let lastRequest: SavedRequest | undefined;
   /** Set by the tool during a turn and applied when the turn settles: a new deadline, or null to cancel. */
   let pendingDeadline: number | null | undefined;
-  /** The window the agent asked for. It outlives turns: a wake pauses warming, and the settle resumes it. */
+  /** The window the agent asked for. It outlives turns: a wake pauses warming, and the settle resumes it, unless the turn failed or was cancelled, which closes the window. */
   let windowDeadline: number | undefined;
   /** The active warming run; undefined while paused by a turn or when no window is armed. */
   let armed: Armed | undefined;
@@ -206,7 +206,7 @@ export default function keepCacheWarm(pi: ExtensionAPI): void {
       name: "keep_cache_warm",
       label: "Keep Cache Warm",
       description:
-        "Keep this session's prompt cache warm while you wait for something you know will wake you, such as a reminder you set or a report you asked for. Call it in the same turn as setting that reminder, with how many minutes from now the cache should stay warm. Warming starts when your turn ends. A turn in between (a reminder or a message waking you) pauses it, and it resumes toward the same deadline when that turn ends. It is capped at the break-even point, past which a cold restart is cheaper. Call it with 0 to cancel.",
+        "Keep this session's prompt cache warm while you wait for something you know will wake you, such as a reminder you set or a report you asked for. Call it in the same turn as setting that reminder, with how many minutes from now the cache should stay warm. Warming starts when your turn ends, unless it fails or is cancelled. A turn in between (a reminder or a message waking you) pauses it, and it resumes toward the same deadline when that turn ends, unless it fails or is cancelled, which closes the window. It is capped at the break-even point, past which a cold restart is cheaper. Call it with 0 to cancel.",
       parameters: Type.Object({
         minutes: Type.Number({ minimum: 0, description: "Minutes from now the cache should stay warm; 0 cancels." }),
       }),
@@ -232,8 +232,8 @@ export default function keepCacheWarm(pi: ExtensionAPI): void {
         const until = `${grantedMinutes} min from now (${new Date(pendingDeadline).toLocaleTimeString()})`;
         const text =
           grantedMinutes < minutes
-            ? `Keeping the cache warm until ${until}, not ${minutes}: past that, a cold restart is cheaper than keeping it warm.`
-            : `Keeping the cache warm until ${until}.`;
+            ? `Keeping the cache warm until ${until}, not ${minutes}: past that, a cold restart is cheaper than keeping it warm. Warming starts when this turn ends, unless it fails or is cancelled.`
+            : `Keeping the cache warm until ${until}. Warming starts when this turn ends, unless it fails or is cancelled.`;
         return {
           content: [{ type: "text" as const, text }],
           details: { grantedMinutes, capMinutes, piWillWarm: piWarms },
