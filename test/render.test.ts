@@ -44,7 +44,8 @@ before(() => {
   handlers.get("message_end")!({ message: { role: "assistant", usage: { cacheRead: 0, cacheWrite: 3_000 } } }, ctx);
 });
 
-const plain = (line: string) => line.replace(/\x1b\[[0-9;:]*m/g, "").trimEnd();
+/** Visible text, with no-break spaces shown as spaces. */
+const plain = (line: string) => line.replace(/\x1b\[[0-9;:]*m/g, "").replaceAll("\u00a0", " ").trimEnd();
 const textResult = (text: string, isError = false): Result => ({ content: [{ type: "text", text }], isError });
 
 /** Renders the tool through Pi's own tool-execution component, as the transcript does. */
@@ -92,6 +93,7 @@ test("narrow widths wrap instead of dropping anything but the hint", () => {
     for (const line of lines) assert.ok(visibleWidth(line) <= width, `Line exceeds width ${width}: ${JSON.stringify(plain(line))}`);
     const joined = lines.map(plain).join("").replace(/\s+/g, "");
     assert.ok(joined.startsWith("●KeepCacheWarm·until7:20PM·50min"), `Width ${width} lost a figure: ${JSON.stringify(lines.map(plain))}`);
+    if (width >= 7) assert.ok(lines.some((line) => plain(line).includes("7:20 PM")) && lines.some((line) => plain(line).includes("50 min")), `Width ${width} split a figure: ${JSON.stringify(lines.map(plain))}`);
   }
   assert.equal(renderTool({ result: textResult(ARMED), width: 72 }).length, 2);
 });

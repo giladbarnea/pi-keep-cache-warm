@@ -25,13 +25,16 @@ function label(theme: Theme, bulletColor: ThemeColor): string {
   return `${theme.fg(bulletColor, "● ")}${theme.fg("text", theme.bold("Keep Cache Warm"))}`;
 }
 
+/** Joins words with a no-break space, so a narrow width never wraps between them. */
+const NO_BREAK = "\u00a0";
+
 /**
- * Drops the seconds from a locale time.
- * @example shortTime("7:20:00 PM") // "7:20 PM"
+ * Drops the seconds from a locale time and keeps it on one line.
+ * @example shortTime("7:20:00 PM") // "7:20\u00a0PM"
  * @example shortTime("19:20:00") // "19:20"
  */
 function shortTime(time: string): string {
-  return time.replace(/(\d:\d\d):\d\d/, "$1");
+  return time.replace(/(\d:\d\d):\d\d/, "$1").replace(/\s/g, NO_BREAK);
 }
 
 /** One receipt line: the first variant that fits the width, longest first; below the last one, it wraps. Cached per width. */
@@ -64,8 +67,8 @@ function renderReceipt(text: string, isError: boolean, theme: Theme): Component 
   const armed = isError ? null : ARMED_SENTENCE.exec(text);
   if (armed) {
     const [, grantedMinutes, time, requestedMinutes, hint] = armed;
-    const capped = requestedMinutes ? [theme.fg("warning", `capped from ${requestedMinutes} min: past that, a cold restart is cheaper`)] : [];
-    const essential = [label(theme, "accent"), `${theme.fg("text", "until ")}${theme.bold(shortTime(time!))}`, theme.fg("success", `${grantedMinutes} min`), ...capped].join(dot);
+    const capped = requestedMinutes ? [theme.fg("warning", `capped from ${requestedMinutes}${NO_BREAK}min: past that, a cold restart is cheaper`)] : [];
+    const essential = [label(theme, "accent"), `${theme.fg("text", "until ")}${theme.bold(shortTime(time!))}`, theme.fg("success", `${grantedMinutes}${NO_BREAK}min`), ...capped].join(dot);
     return new ReceiptLine(hint ? [`${essential}${dot}${theme.fg("dim", "starts when this turn ends")}`, essential] : [essential]);
   }
   if (!isError && text === CANCELLED_SENTENCE) return new ReceiptLine([`${label(theme, "muted")}${dot}${theme.fg("muted", "cancelled")}`]);
