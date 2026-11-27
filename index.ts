@@ -8,12 +8,67 @@ import {
   type Model,
   type Usage,
 } from "@earendil-works/pi-ai";
-import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { defineTool, type ExtensionAPI, type ExtensionContext, type Theme, type ThemeColor } from "@earendil-works/pi-coding-agent";
+import { type Component, Text, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { breakEvenDeadline, nextStep, readWholePrefix } from "./schedule.ts";
 
 const ENTRY_TYPE = "keep-cache-warm";
 const MINUTE = 60_000;
+
+/** The tool's own sentences, read back for display only. Results from older versions lack the start hint. */
+const ARMED_SENTENCE =
+  /^Keeping the cache warm until (\d+) min from now \(([^)]+)\)(?:, not (\d+): past that, a cold restart is cheaper than keeping it warm)?\.( Warming starts when this turn ends, unless it fails or is cancelled\.)?$/;
+const CANCELLED_SENTENCE = "Cache warming cancelled.";
+
+function label(theme: Theme, bulletColor: ThemeColor): string {
+  return `${theme.fg(bulletColor, "● ")}${theme.fg("text", theme.bold("Keep Cache Warm"))}`;
+}
+
+/**
+ * Drops the seconds from a locale time.
+ * @example shortTime("7:20:00 PM") // "7:20 PM"
+ * @example shortTime("19:20:00") // "19:20"
+ */
+function shortTime(time: string): string {
+  return time.replace(/(\d:\d\d):\d\d/, "$1");
+}
+
+/** An armed receipt is one line. When it does not fit, it drops the start hint first, and wraps only below that. */
+class ArmedReceipt implements Component {
+  private readonly full: Text;
+  private readonly fullWidth: number;
+  private readonly essential: Text;
+
+  constructor(full: string, essential: string) {
+    this.full = new Text(full, 0, 0);
+    this.fullWidth = visibleWidth(full);
+    this.essential = new Text(essential, 0, 0);
+  }
+
+  render(width: number): string[] {
+    return (this.fullWidth <= width ? this.full : this.essential).render(width);
+  }
+
+  invalidate(): void {
+    this.full.invalidate();
+    this.essential.invalidate();
+  }
+}
+
+/** One line per result: armed, cancelled, or the label beside the full text of an error or a text this renderer does not know. */
+function renderReceipt(text: string, isError: boolean, theme: Theme): Component {
+  const dot = theme.fg("dim", " · ");
+  const armed = isError ? null : ARMED_SENTENCE.exec(text);
+  if (armed) {
+    const [, grantedMinutes, time, requestedMinutes, hint] = armed;
+    const capped = requestedMinutes ? [theme.fg("warning", `capped from ${requestedMinutes} min: past that, a cold restart is cheaper`)] : [];
+    const essential = [label(theme, "accent"), `${theme.fg("text", "until ")}${theme.bold(shortTime(time!))}`, theme.fg("success", `${grantedMinutes} min`), ...capped].join(dot);
+    return new ArmedReceipt(hint ? `${essential}${dot}${theme.fg("dim", "starts when this turn ends")}` : essential, essential);
+  }
+  if (!isError && text === CANCELLED_SENTENCE) return new Text(`${label(theme, "muted")}${dot}${theme.fg("muted", "cancelled")}`, 0, 0);
+  return new Text(`${label(theme, isError ? "error" : "muted")}${dot}${theme.fg(isError ? "error" : "toolOutput", text)}`, 0, 0);
+}
 
 /** The last real session request: its exact provider payload, what it cached, and whether it ended in an error or abort. */
 type SavedRequest = { payload: Record<string, unknown>; model: Model<any>; sentAt: number; prefixTokens: number; failed: boolean };
@@ -239,6 +294,10 @@ export default function keepCacheWarm(pi: ExtensionAPI): void {
           details: { grantedMinutes, capMinutes, piWillWarm: piWarms },
         };
       },
+      renderShell: "self",
+      renderCall: (_arguments, theme, context) => new Text(context.executionStarted && context.isPartial ? label(theme, "warning") : "", 0, 0),
+      renderResult: (result, _options, theme, context) =>
+        renderReceipt(result.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n"), context.isError, theme),
     }),
   );
 }
