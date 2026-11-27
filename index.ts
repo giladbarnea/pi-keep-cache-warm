@@ -9,7 +9,7 @@ import {
   type Usage,
 } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI, type ExtensionContext, type Theme, type ThemeColor } from "@earendil-works/pi-coding-agent";
-import { type Component, Text, visibleWidth } from "@earendil-works/pi-tui";
+import { type Component, Text, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { breakEvenDeadline, nextStep, readWholePrefix } from "./schedule.ts";
 
@@ -34,25 +34,27 @@ function shortTime(time: string): string {
   return time.replace(/(\d:\d\d):\d\d/, "$1");
 }
 
-/** An armed receipt is one line. When it does not fit, it drops the start hint first, and wraps only below that. */
-class ArmedReceipt implements Component {
-  private readonly full: Text;
-  private readonly fullWidth: number;
-  private readonly essential: Text;
+/** One receipt line: the first variant that fits the width, longest first; below the last one, it wraps. Cached per width. */
+class ReceiptLine implements Component {
+  private readonly variants: { line: string; width: number }[];
+  private cachedWidth: number | undefined;
+  private cachedLines: string[] = [];
 
-  constructor(full: string, essential: string) {
-    this.full = new Text(full, 0, 0);
-    this.fullWidth = visibleWidth(full);
-    this.essential = new Text(essential, 0, 0);
+  constructor(variants: string[]) {
+    this.variants = variants.map((line) => ({ line, width: visibleWidth(line) }));
   }
 
   render(width: number): string[] {
-    return (this.fullWidth <= width ? this.full : this.essential).render(width);
+    if (width !== this.cachedWidth) {
+      this.cachedWidth = width;
+      const fitting = this.variants.find((variant) => variant.width <= width);
+      this.cachedLines = fitting ? [fitting.line] : wrapTextWithAnsi(this.variants.at(-1)!.line, width);
+    }
+    return this.cachedLines;
   }
 
   invalidate(): void {
-    this.full.invalidate();
-    this.essential.invalidate();
+    this.cachedWidth = undefined;
   }
 }
 
@@ -64,9 +66,9 @@ function renderReceipt(text: string, isError: boolean, theme: Theme): Component 
     const [, grantedMinutes, time, requestedMinutes, hint] = armed;
     const capped = requestedMinutes ? [theme.fg("warning", `capped from ${requestedMinutes} min: past that, a cold restart is cheaper`)] : [];
     const essential = [label(theme, "accent"), `${theme.fg("text", "until ")}${theme.bold(shortTime(time!))}`, theme.fg("success", `${grantedMinutes} min`), ...capped].join(dot);
-    return new ArmedReceipt(hint ? `${essential}${dot}${theme.fg("dim", "starts when this turn ends")}` : essential, essential);
+    return new ReceiptLine(hint ? [`${essential}${dot}${theme.fg("dim", "starts when this turn ends")}`, essential] : [essential]);
   }
-  if (!isError && text === CANCELLED_SENTENCE) return new Text(`${label(theme, "muted")}${dot}${theme.fg("muted", "cancelled")}`, 0, 0);
+  if (!isError && text === CANCELLED_SENTENCE) return new ReceiptLine([`${label(theme, "muted")}${dot}${theme.fg("muted", "cancelled")}`]);
   return new Text(`${label(theme, isError ? "error" : "muted")}${dot}${theme.fg(isError ? "error" : "toolOutput", text)}`, 0, 0);
 }
 
